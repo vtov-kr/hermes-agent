@@ -1194,6 +1194,151 @@ class TestBangPrefixCommands:
         assert msg_event.text.startswith("/queue")
         assert msg_event.message_type == MessageType.COMMAND
 
+    @pytest.mark.asyncio
+    async def test_bang_with_leading_whitespace_resolves(self, adapter):
+        """Slack keeps leading spaces; they must not defeat the rewrite."""
+        await adapter._handle_slack_message(self._make_event("  !queue"))
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text.startswith("/queue")
+        assert msg_event.message_type == MessageType.COMMAND
+
+
+# ---------------------------------------------------------------------------
+# TestBangBehindWakeWord
+# ---------------------------------------------------------------------------
+
+
+WAKE_WORD = "하니님"
+WAKE_BOT_UID = "U_BOT"
+WAKE_TEAM_ID = "T_TEAM"
+
+
+class TestBangBehindWakeWord:
+    """A bang typed behind an address form still dispatches as a command.
+
+    Under ``strict_mention`` the bot has to be addressed on every single
+    turn, so a bare ``!cmd`` never clears the mention gate in a channel.
+    Addressing it puts the ``!`` off the front of the message, which used
+    to skip the rewrite and deliver the command to the agent as chat.
+    """
+
+    def _make_event(self, text, thread_ts=None):
+        evt = {
+            "text": text,
+            "user": "U_USER",
+            "channel": "C_CHAN",
+            "channel_type": "channel",
+            "team": WAKE_TEAM_ID,
+            "ts": "1234567890.000001",
+        }
+        if thread_ts:
+            evt["thread_ts"] = thread_ts
+        return evt
+
+    @pytest.fixture
+    def adapter(self):
+        config = PlatformConfig(
+            enabled=True,
+            token="xoxb-fake-token",
+            extra={
+                "require_mention": True,
+                "strict_mention": True,
+                "mention_patterns": [WAKE_WORD],
+            },
+        )
+        a = SlackAdapter(config)
+        a._app = MagicMock()
+        a._app.client = AsyncMock()
+        a._bot_user_id = WAKE_BOT_UID
+        a._team_bot_user_ids = {WAKE_TEAM_ID: WAKE_BOT_UID}
+        a._running = True
+        a.handle_message = AsyncMock()
+        return a
+
+    @pytest.mark.asyncio
+    async def test_mention_then_bang_dispatches(self, adapter):
+        """``@bot !model gpt-5.4`` → ``/model gpt-5.4``."""
+        await adapter._handle_slack_message(
+            self._make_event(f"<@{WAKE_BOT_UID}> !model gpt-5.4")
+        )
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text == "/model gpt-5.4"
+        assert msg_event.message_type == MessageType.COMMAND
+
+    @pytest.mark.asyncio
+    async def test_wake_word_then_bang_dispatches(self, adapter):
+        """``하니님 !compress here 3`` → ``/compress here 3``."""
+        await adapter._handle_slack_message(
+            self._make_event(f"{WAKE_WORD} !compress here 3")
+        )
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text == "/compress here 3"
+        assert msg_event.message_type == MessageType.COMMAND
+
+    @pytest.mark.asyncio
+    async def test_trailing_wake_word_is_not_an_argument(self, adapter):
+        """``!model gpt-5.4 하니님`` must not pass the wake-word to /model."""
+        await adapter._handle_slack_message(
+            self._make_event(f"!model gpt-5.4 {WAKE_WORD}")
+        )
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text == "/model gpt-5.4"
+        assert msg_event.message_type == MessageType.COMMAND
+
+    @pytest.mark.asyncio
+    async def test_bang_inside_thread_dispatches(self, adapter):
+        """The thread case this exists for, with the wake-word in front."""
+        evt = self._make_event(
+            f"{WAKE_WORD} !stop", thread_ts="1111111111.000001"
+        )
+        await adapter._handle_slack_message(evt)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text == "/stop"
+        assert msg_event.message_type == MessageType.COMMAND
+        assert msg_event.source.thread_id == "1111111111.000001"
+
+    @pytest.mark.asyncio
+    async def test_mid_sentence_bang_is_not_a_command(self, adapter):
+        """Only a leading bang counts — quoting a command is still chat."""
+        text = f"{WAKE_WORD} 이거 봐줘 !status 라고 나와요"
+        await adapter._handle_slack_message(self._make_event(text))
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text == text
+        assert msg_event.message_type != MessageType.COMMAND
+
+    @pytest.mark.asyncio
+    async def test_unknown_bang_token_passes_through(self, adapter):
+        """``하니님 !nice work`` is chat — and keeps its wake-word."""
+        text = f"{WAKE_WORD} !nice work"
+        await adapter._handle_slack_message(self._make_event(text))
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text == text
+        assert msg_event.message_type != MessageType.COMMAND
+
+    @pytest.mark.asyncio
+    async def test_path_after_wake_word_is_not_a_command(self, adapter):
+        """A filesystem path must never be mistaken for a slash command."""
+        text = f"{WAKE_WORD} 이거 /etc/hosts 좀 봐줘"
+        await adapter._handle_slack_message(self._make_event(text))
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text == text
+        assert msg_event.message_type != MessageType.COMMAND
+
+    @pytest.mark.asyncio
+    async def test_bare_bang_in_channel_still_gated(self, adapter):
+        """strict_mention is unchanged: an unaddressed bang is ignored."""
+        await adapter._handle_slack_message(self._make_event("!model gpt-5.4"))
+
+        adapter.handle_message.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # TestIncomingDocumentHandling
