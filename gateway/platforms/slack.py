@@ -104,6 +104,32 @@ def check_slack_requirements() -> bool:
     return ensure_and_bind("platform.slack", _import, globals(), prompt=False)
 
 
+def _rewrite_known_bang_command(text: str) -> str:
+    """Rewrite a leading ``!command`` into ``/command`` when it resolves.
+
+    Slack rejects native slash commands inside thread replies ("/queue is
+    not supported in threads. Sorry!"), so ``!`` doubles as a command
+    prefix.  Only the first token is checked against the gateway command
+    registry, which leaves casual messages like "!nice work" untouched.
+    Returns ``text`` unchanged when it does not open a known command.
+    """
+    stripped = text.lstrip()
+    if not stripped.startswith("!"):
+        return text
+    try:
+        from hermes_cli.commands import is_gateway_known_command
+
+        first_token = stripped[1:].split(maxsplit=1)[0]
+        # Strip "@suffix" the same way get_command() does, so forms like
+        # ``!stop@hermes`` still resolve.
+        cmd_name = first_token.split("@", 1)[0].lower()
+        if cmd_name and "/" not in cmd_name and is_gateway_known_command(cmd_name):
+            return "/" + stripped[1:]
+    except Exception:  # pragma: no cover - defensive
+        pass
+    return text
+
+
 def _extract_text_from_slack_blocks(blocks: list) -> str:
     """Extract readable text from Slack Block Kit blocks, including quoted/forwarded content.
 
@@ -2140,28 +2166,15 @@ class SlackAdapter(BasePlatformAdapter):
         original_text = event.get("text", "")
 
         # Slack blocks native slash commands inside threads ("/queue is not
-        # supported in threads. Sorry!").  As a workaround, recognise a
-        # leading ``!`` as an alternate command prefix and rewrite it to
-        # ``/`` so the rest of the pipeline (MessageType.COMMAND tagging,
-        # gateway dispatcher) handles it like a normal slash command.  Only
-        # rewrite when the first token resolves to a known gateway command
-        # so casual messages like "!nice work" pass through unchanged.
-        if original_text.startswith("!"):
-            try:
-                from hermes_cli.commands import is_gateway_known_command
-
-                first_token = original_text[1:].split(maxsplit=1)[0]
-                # Strip "@suffix" the same way get_command() does, so
-                # forms like ``!stop@hermes`` still resolve.
-                cmd_name = first_token.split("@", 1)[0].lower()
-                if (
-                    cmd_name
-                    and "/" not in cmd_name
-                    and is_gateway_known_command(cmd_name)
-                ):
-                    original_text = "/" + original_text[1:]
-            except Exception:  # pragma: no cover - defensive
-                pass
+        # supported in threads. Sorry!").  As a workaround, a leading ``!``
+        # is rewritten to ``/`` so the rest of the pipeline (COMMAND tagging,
+        # gateway dispatcher) handles it like a normal slash command.
+        #
+        # A bang typed behind an address form (``@bot !stop``, ``하니님
+        # !stop``) cannot be resolved here — the bot user id and the wake-word
+        # patterns are only known further down — so it is retried right after
+        # the mention gate.
+        original_text = _rewrite_known_bang_command(original_text)
 
         text = original_text
 
@@ -2335,6 +2348,9 @@ class SlackAdapter(BasePlatformAdapter):
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         routing_text = original_text or ""
         is_mentioned = bot_uid and f"<@{bot_uid}>" in routing_text
+        # Hoisted out of the channel gate below: the bang retry after the gate
+        # needs it on every code path, DMs included.
+        matches_pattern = self._message_matches_mention_patterns(routing_text)
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
@@ -2347,7 +2363,6 @@ class SlackAdapter(BasePlatformAdapter):
                 )
                 return
 
-            matches_pattern = self._message_matches_mention_patterns(routing_text)
             if channel_id in self._slack_free_response_channels():
                 pass  # Free-response channel — always process
             elif not self._slack_require_mention():
@@ -2396,6 +2411,38 @@ class SlackAdapter(BasePlatformAdapter):
                 ):
                     return
 
+        # Retry the bang rewrite for a command typed behind an address form
+        # (``@bot !model gpt-5.4``, ``하니님 !model gpt-5.4``).  The gate above
+        # demands a wake-word on every turn under strict_mention, which would
+        # otherwise leave bang commands unusable in channels: the ``!`` is not
+        # the first character any more, so the early rewrite skipped it.
+        #
+        # Wake-words are dropped from the resulting command — they address the
+        # bot, they are not arguments.  That also repairs the trailing form
+        # (``!model gpt-5.4 하니님``), which used to feed the wake-word to
+        # /model as part of the model name.
+        if not original_text.startswith("/") and (is_mentioned or matches_pattern):
+            rewritten = _rewrite_known_bang_command(
+                self._strip_wake_words(original_text, bot_uid)
+            )
+            if rewritten.startswith("/"):
+                # Replaces ``text`` outright: any blocks/attachment text merged
+                # in above is addressed to the agent, not to the dispatcher.
+                original_text = rewritten
+                text = rewritten
+
+        # A bang with a *trailing* wake-word (``!model gpt-5.4 하니님``) was
+        # already rewritten at the top of this method, so it skips the retry
+        # above — but the wake-word is still sitting in the argument list,
+        # where /model reads it as part of the model name.  Drop it here.
+        # Guarded on the leading "/" so a mid-sentence path (``하니님 이거
+        # /etc/hosts 봐줘``) is never mistaken for a command.
+        elif original_text.startswith("/") and matches_pattern:
+            stripped = self._strip_wake_words(original_text, bot_uid)
+            if stripped.startswith("/"):
+                original_text = stripped
+                text = stripped
+
         if is_mentioned:
             # Strip the bot mention from the text
             text = text.replace(f"<@{bot_uid}>", "").strip()
@@ -2412,12 +2459,20 @@ class SlackAdapter(BasePlatformAdapter):
                     for t in to_remove:
                         self._mentioned_threads.discard(t)
 
+        is_command_message = (original_text or "").startswith("/")
+
         # When entering a thread for the first time (no existing session),
         # fetch thread context so the agent understands the conversation.
-        if is_thread_reply and not self._has_active_session_for_thread(
-            channel_id=channel_id,
-            thread_ts=event_thread_ts,
-            user_id=user_id,
+        # Skipped for commands — the dispatcher parses the message text
+        # verbatim, so a prepended transcript would break the command.
+        if (
+            is_thread_reply
+            and not is_command_message
+            and not self._has_active_session_for_thread(
+                channel_id=channel_id,
+                thread_ts=event_thread_ts,
+                user_id=user_id,
+            )
         ):
             thread_context = await self._fetch_thread_context(
                 channel_id=channel_id,
@@ -2430,7 +2485,7 @@ class SlackAdapter(BasePlatformAdapter):
 
         # Determine message type
         msg_type = MessageType.TEXT
-        if (original_text or "").startswith("/"):
+        if is_command_message:
             msg_type = MessageType.COMMAND
 
         # Handle file attachments
@@ -3686,3 +3741,15 @@ class SlackAdapter(BasePlatformAdapter):
         if not text or not self._mention_patterns:
             return False
         return any(pattern.search(text) for pattern in self._mention_patterns)
+
+    def _strip_wake_words(self, text: str, bot_uid: Optional[str]) -> str:
+        """Drop the bot mention and any wake-word hits from ``text``.
+
+        Only used to probe for a command hidden behind an address form —
+        ordinary messages still reach the agent with their wake-word intact.
+        """
+        if bot_uid:
+            text = text.replace(f"<@{bot_uid}>", " ")
+        for pattern in self._mention_patterns:
+            text = pattern.sub(" ", text)
+        return text.strip()
